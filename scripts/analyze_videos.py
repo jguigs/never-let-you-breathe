@@ -40,6 +40,45 @@ from datetime import datetime
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
+# GPU DETECTION + SINGLETON CLASSIFIER
+# ─────────────────────────────────────────────────────────────
+
+import torch as _torch
+DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+DEVICE_IDX = 0 if DEVICE == "cuda" else -1
+print(f"[INIT] Device: {DEVICE}" + (f" ({_torch.cuda.get_device_name(0)})" if DEVICE == "cuda" else ""))
+
+_whisper_model = None
+_emotion_classifier = None
+
+def get_whisper_model():
+    """Singleton: load Whisper once, reuse across all videos."""
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        print(f"    Loading Whisper '{CONFIG['whisper_model']}' on {DEVICE}...")
+        _whisper_model = whisper.load_model(CONFIG["whisper_model"], device=DEVICE)
+    return _whisper_model
+
+# ─────────────────────────────────────────────────────────────
+# SINGLETON CLASSIFIER (see get_emotion_classifier above)
+# ─────────────────────────────────────────────────────────────
+
+def get_emotion_classifier():
+    """Singleton: load the emotion classifier once, reuse across all videos."""
+    global _emotion_classifier
+    if _emotion_classifier is None:
+        from transformers import pipeline as _hf_pipeline
+        print(f"    Loading emotion model on {DEVICE}...")
+        _emotion_classifier = _hf_pipeline(
+            "text-classification",
+            model=CONFIG["emotion_model"],
+            top_k=None,
+            device=DEVICE_IDX,
+        )
+    return _emotion_classifier
+
+# ─────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
@@ -73,6 +112,11 @@ CONFIG = {
 
     # Sustained activation
     "energy_high_percentile": 70,   # Percentile above which energy is "high"
+    "sustained_activation_min_seconds": 3.0,  # One full classification window; activation must persist this long to count as sustained
+    "recovery_min_seconds": 2.0,  # Lower than activation threshold because recovery intervals in short-form video are naturally shorter, but filters single-window noise
+
+    # Robustness: alternative window configs to bracket the primary (3.0, 1.0)
+    "robustness_window_configs": [(2.0, 1.0), (4.0, 1.0)],
 }
 
 
@@ -97,55 +141,50 @@ def analyze_cuts(video_path):
     import cv2
     import subprocess
 
-    # --- Method 1: Try ffprobe scene detection first (most reliable) ---
+    # --- Method 1: ffmpeg scene detection (works on AV1/VP9 webm) ---
     try:
+        import re as _re
         cmd = [
-            "ffprobe", "-v", "quiet",
-            "-show_entries", "frame=pts_time",
-            "-select_streams", "v:0",
-            "-of", "csv=p=0",
-            "-f", "lavfi",
-            f"movie={str(video_path)},select='gt(scene,0.3)'"
+            "ffmpeg", "-i", str(video_path),
+            "-vf", "select='gt(scene,0.3)',metadata=print:file=/dev/stdout",
+            "-an", "-f", "null", "-",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0 and result.stdout.strip():
-            timestamps = []
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if line:
-                    try:
-                        timestamps.append(float(line))
-                    except ValueError:
-                        continue
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        # pts_time appears on "frame:N  pts:...  pts_time:VALUE" lines in stdout
+        timestamps = []
+        for line in result.stdout.split("\n"):
+            m = _re.search(r"pts_time:([\d.]+)", line)
+            if m:
+                timestamps.append(float(m.group(1)))
 
-            if timestamps:
-                # Get duration
-                dur_cmd = [
-                    "ffprobe", "-v", "quiet",
-                    "-show_entries", "format=duration",
-                    "-of", "csv=p=0",
-                    str(video_path),
-                ]
-                dur_result = subprocess.run(dur_cmd, capture_output=True, text=True, timeout=10)
-                duration = float(dur_result.stdout.strip()) if dur_result.stdout.strip() else 0
+        if timestamps:
+            # Get duration
+            dur_cmd = [
+                "ffprobe", "-v", "quiet",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                str(video_path),
+            ]
+            dur_result = subprocess.run(dur_cmd, capture_output=True, text=True, timeout=10)
+            duration = float(dur_result.stdout.strip()) if dur_result.stdout.strip() else 0
 
-                if duration > 0:
-                    # Filter out cuts too close together
-                    min_interval = 0.15  # seconds
-                    filtered = [timestamps[0]]
-                    for t in timestamps[1:]:
-                        if t - filtered[-1] >= min_interval:
-                            filtered.append(t)
+            if duration > 0:
+                # Filter out cuts too close together
+                min_interval = 0.15  # seconds
+                filtered = [timestamps[0]]
+                for t in timestamps[1:]:
+                    if t - filtered[-1] >= min_interval:
+                        filtered.append(t)
 
-                    cuts_per_minute = (len(filtered) / duration) * 60
+                cuts_per_minute = (len(filtered) / duration) * 60
 
-                    return {
-                        "cuts_per_minute": round(cuts_per_minute, 2),
-                        "total_cuts": len(filtered),
-                        "duration_seconds": round(duration, 2),
-                        "cut_timestamps": [round(t, 2) for t in filtered],
-                        "detection_method": "ffprobe_scene",
-                    }
+                return {
+                    "cuts_per_minute": round(cuts_per_minute, 2),
+                    "total_cuts": len(filtered),
+                    "duration_seconds": round(duration, 2),
+                    "cut_timestamps": [round(t, 2) for t in filtered],
+                    "detection_method": "ffmpeg_scene",
+                }
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         pass  # Fall through to OpenCV method
 
@@ -165,6 +204,26 @@ def analyze_cuts(video_path):
     prev_hist = None
     correlations = []
     frame_idx = 0
+
+    # Early bail-out: if the first frame can't be read (e.g. AV1 decode failure),
+    # skip the entire OpenCV path rather than looping through an empty capture
+    ret, first_frame = cap.read()
+    if not ret:
+        cap.release()
+        return {
+            "cuts_per_minute": 0,
+            "total_cuts": 0,
+            "duration_seconds": round(duration, 2),
+            "cut_timestamps": [],
+            "detection_method": "opencv_failed",
+        }
+
+    # Process first frame
+    hsv = cv2.cvtColor(first_frame, cv2.COLOR_BGR2HSV)
+    small = cv2.resize(hsv, (160, 90))
+    prev_hist = cv2.calcHist([small], [0, 1], None, [50, 60], [0, 180, 0, 256])
+    cv2.normalize(prev_hist, prev_hist)
+    frame_idx = 1
 
     while True:
         ret, frame = cap.read()
@@ -274,6 +333,11 @@ def analyze_silence(audio_path):
                 segments.append({"start": round(start, 2), "end": round(end, 2)})
             in_silence = False
 
+    if in_silence:
+        end = len(silence_mask) * frame_duration
+        if (end - start) > 0.1:
+            segments.append({"start": round(start, 2), "end": round(end, 2)})
+
     return {
         "silence_percentage": round(silence_pct, 2),
         "silence_segments": segments,
@@ -290,9 +354,7 @@ def analyze_speech(audio_path):
     Transcribe audio with Whisper and calculate speaking pace.
     Returns: wpm, word_count, transcript, word_timestamps
     """
-    import whisper
-
-    model = whisper.load_model(CONFIG["whisper_model"])
+    model = get_whisper_model()
     result = model.transcribe(
         str(audio_path),
         word_timestamps=True,
@@ -380,26 +442,22 @@ def analyze_music(audio_path):
 # TIME-SERIES: EMOTIONAL SEQUENCING
 # ─────────────────────────────────────────────────────────────
 
-def analyze_emotions(transcript_data):
+def analyze_emotions(transcript_data, window_seconds=None, step_seconds=None):
     """
     Run emotion classification on sliding windows of the transcript.
     Returns time-series of emotion labels and scores.
-    """
-    from transformers import pipeline
 
+    Optional window_seconds/step_seconds override CONFIG defaults (used for
+    robustness checks across alternative window sizes).
+    """
     if not transcript_data["word_timestamps"]:
         return {"emotion_timeseries": [], "dominant_emotions": {}}
 
-    classifier = pipeline(
-        "text-classification",
-        model=CONFIG["emotion_model"],
-        top_k=None,
-        device=-1,  # CPU
-    )
+    classifier = get_emotion_classifier()
 
     words = transcript_data["word_timestamps"]
-    window_size = CONFIG["emotion_window_seconds"]
-    step_size = CONFIG["emotion_step_seconds"]
+    window_size = window_seconds if window_seconds is not None else CONFIG["emotion_window_seconds"]
+    step_size = step_seconds if step_seconds is not None else CONFIG["emotion_step_seconds"]
 
     # Determine time range
     start_time = words[0]["start"]
@@ -451,8 +509,40 @@ def analyze_emotions(transcript_data):
         for k, v in emotion_counts.items()
     } if total > 0 else {}
 
+    # Build contiguous emotion spans by merging adjacent/overlapping windows
+    # with the same dominant emotion. When emotions differ between overlapping
+    # windows, clip the new span's start to the previous span's end so that
+    # spans tile the timeline without overlaps.
+    spans = []
+    for entry in timeseries:
+        emotion = entry["dominant_emotion"]
+        t_start = entry["time_start"]
+        t_end = entry["time_end"]
+        if spans and spans[-1]["emotion"] == emotion:
+            # Extend the current span to the end of this window
+            spans[-1]["end"] = t_end
+            spans[-1]["duration_seconds"] = round(spans[-1]["end"] - spans[-1]["start"], 2)
+        else:
+            # Clip start to previous span's end to avoid overlap
+            if spans and t_start < spans[-1]["end"]:
+                t_start = spans[-1]["end"]
+            spans.append({
+                "emotion": emotion,
+                "start": t_start,
+                "end": t_end,
+                "duration_seconds": round(t_end - t_start, 2),
+            })
+
+    # speech_covered_seconds = distance from first window start to last window end
+    if timeseries:
+        speech_covered_seconds = round(timeseries[-1]["time_end"] - timeseries[0]["time_start"], 2)
+    else:
+        speech_covered_seconds = 0
+
     return {
         "emotion_timeseries": timeseries,
+        "emotion_spans": spans,
+        "speech_covered_seconds": speech_covered_seconds,
         "emotion_distribution": emotion_distribution,
         "total_windows": total,
     }
@@ -585,12 +675,86 @@ def compute_manipulation_metrics(emotion_data, prosody_data, silence_data):
                 current_streak = 0
         metrics["max_activation_streak"] = max_streak
 
+        # Duration-based metrics from emotion spans
+        spans = emotion_data.get("emotion_spans", [])
+        speech_covered = emotion_data.get("speech_covered_seconds", 0)
+
+        high_activation_seconds = sum(
+            s["duration_seconds"] for s in spans
+            if s["emotion"] in CONFIG["high_activation_emotions"]
+        )
+        recovery_seconds = sum(
+            s["duration_seconds"] for s in spans
+            if s["emotion"] in CONFIG["recovery_emotions"]
+        )
+
+        metrics["speech_covered_seconds"] = speech_covered
+        metrics["high_activation_seconds"] = round(high_activation_seconds, 2)
+        metrics["recovery_seconds"] = round(recovery_seconds, 2)
+        metrics["high_activation_time_pct"] = round(
+            high_activation_seconds / speech_covered * 100, 1
+        ) if speech_covered > 0 else 0
+        metrics["recovery_time_pct"] = round(
+            recovery_seconds / speech_covered * 100, 1
+        ) if speech_covered > 0 else 0
+
+        # Sustained activation bouts: high-activation spans >= minimum duration
+        min_sustained = CONFIG["sustained_activation_min_seconds"]
+        activation_spans = [
+            s for s in spans
+            if s["emotion"] in CONFIG["high_activation_emotions"]
+        ]
+        sustained_bouts = [s for s in activation_spans if s["duration_seconds"] >= min_sustained]
+        sustained_seconds = sum(s["duration_seconds"] for s in sustained_bouts)
+        longest_bout = max((s["duration_seconds"] for s in activation_spans), default=0)
+
+        metrics["sustained_activation_bout_count"] = len(sustained_bouts)
+        metrics["sustained_activation_seconds"] = round(sustained_seconds, 2)
+        metrics["sustained_activation_time_pct"] = round(
+            sustained_seconds / speech_covered * 100, 1
+        ) if speech_covered > 0 else 0
+        metrics["longest_activation_bout_seconds"] = round(longest_bout, 2)
+
+        # Duration-qualified recovery bouts: recovery spans >= minimum duration
+        min_recovery = CONFIG["recovery_min_seconds"]
+        recovery_spans = [
+            s for s in spans
+            if s["emotion"] in CONFIG["recovery_emotions"]
+        ]
+        true_recovery_bouts = [s for s in recovery_spans if s["duration_seconds"] >= min_recovery]
+        true_recovery_secs = sum(s["duration_seconds"] for s in true_recovery_bouts)
+        longest_recovery = max((s["duration_seconds"] for s in recovery_spans), default=0)
+
+        metrics["true_recovery_bout_count"] = len(true_recovery_bouts)
+        metrics["true_recovery_seconds"] = round(true_recovery_secs, 2)
+        metrics["true_recovery_time_pct"] = round(
+            true_recovery_secs / speech_covered * 100, 1
+        ) if speech_covered > 0 else 0
+        metrics["mean_recovery_bout_seconds"] = round(
+            true_recovery_secs / len(true_recovery_bouts), 2
+        ) if true_recovery_bouts else 0
+        metrics["longest_recovery_bout_seconds"] = round(longest_recovery, 2)
+
     else:
         metrics["high_activation_pct"] = 0
         metrics["recovery_pct"] = 0
         metrics["recovery_period_count"] = 0
         metrics["emotional_diversity"] = 0
         metrics["max_activation_streak"] = 0
+        metrics["speech_covered_seconds"] = 0
+        metrics["high_activation_seconds"] = 0
+        metrics["recovery_seconds"] = 0
+        metrics["high_activation_time_pct"] = 0
+        metrics["recovery_time_pct"] = 0
+        metrics["sustained_activation_bout_count"] = 0
+        metrics["sustained_activation_seconds"] = 0
+        metrics["sustained_activation_time_pct"] = 0
+        metrics["longest_activation_bout_seconds"] = 0
+        metrics["true_recovery_bout_count"] = 0
+        metrics["true_recovery_seconds"] = 0
+        metrics["true_recovery_time_pct"] = 0
+        metrics["mean_recovery_bout_seconds"] = 0
+        metrics["longest_recovery_bout_seconds"] = 0
 
     # --- Prosodic sustained activation ---
     if prosody_data.get("energy_stats"):
@@ -614,8 +778,8 @@ def compute_manipulation_metrics(emotion_data, prosody_data, silence_data):
     # inverse of energy CV (low variance = flatline high)
     # This is exploratory — report components individually in the paper,
     # use composite only for the public scorecard.
-    ha = metrics["high_activation_pct"]
-    rec_inv = 100 - metrics["recovery_pct"]
+    ha = metrics.get("high_activation_time_pct", metrics["high_activation_pct"])
+    rec_inv = 100 - metrics.get("true_recovery_time_pct", metrics["recovery_pct"])
     sil_inv = 100 - metrics["silence_pct"]
     # Normalize energy CV (typical range 0-1, invert so low CV = high score)
     ecv_score = max(0, min(100, (1 - metrics["energy_cv"]) * 100))
@@ -623,6 +787,23 @@ def compute_manipulation_metrics(emotion_data, prosody_data, silence_data):
     metrics["relentlessness_composite"] = round(
         (ha * 0.3 + rec_inv * 0.25 + sil_inv * 0.25 + ecv_score * 0.2), 1
     )
+
+    # --- Named subconstruct components (interpretive groupings of existing metrics) ---
+
+    # Activation pressure component: how much speech time is high-activation,
+    # and how much of that is sustained (not brief spikes)
+    ha_time = metrics.get("high_activation_time_pct", 0)
+    sa_time = metrics.get("sustained_activation_time_pct", 0)
+    metrics["activation_pressure"] = round((ha_time + sa_time) / 2, 1)
+
+    # Recovery scarcity component: how little recovery time the viewer gets.
+    # Higher = less recovery. Bout count reported separately (not normalized).
+    tr_time = metrics.get("true_recovery_time_pct", 0)
+    metrics["recovery_scarcity"] = round(100 - tr_time, 1)
+
+    # Space compression component: how little silence and how little vocal
+    # variation exist — captures the absence of breathing room
+    metrics["space_compression"] = round((sil_inv + ecv_score) / 2, 1)
 
     return metrics
 
@@ -702,6 +883,37 @@ def analyze_single_video(video_path, temp_dir):
     )
     results["manipulation_metrics"] = manipulation_data
 
+    # Denominator fields: separate speech-covered time from full-audio time
+    full_audio = silence_data["total_duration"] if silence_data else 0
+    speech_covered = emotion_data.get("speech_covered_seconds", 0)
+    results["denominators"] = {
+        "full_audio_seconds": full_audio,
+        "speech_covered_seconds": speech_covered,
+        "non_speech_seconds": round(full_audio - speech_covered, 2),
+        "speech_density_pct": round(
+            speech_covered / full_audio * 100, 1
+        ) if full_audio > 0 else 0,
+    }
+
+    # Step 9: Robustness checks — re-run emotion windowing with alternative configs
+    # Reuses transcript (speech_data), prosody, and silence from the primary run
+    robustness_configs = CONFIG.get("robustness_window_configs", [])
+    if robustness_configs and speech_data.get("word_timestamps"):
+        robustness = {}
+        for win_sec, step_sec in robustness_configs:
+            config_key = f"{win_sec}s_{step_sec}s"
+            print(f"    Robustness check: {config_key}...")
+            rob_emotion = analyze_emotions(speech_data, window_seconds=win_sec, step_seconds=step_sec)
+            rob_metrics = compute_manipulation_metrics(rob_emotion, prosody_data, silence_data)
+            robustness[config_key] = {
+                "high_activation_time_pct": rob_metrics.get("high_activation_time_pct", 0),
+                "recovery_time_pct": rob_metrics.get("recovery_time_pct", 0),
+                "sustained_activation_time_pct": rob_metrics.get("sustained_activation_time_pct", 0),
+                "true_recovery_time_pct": rob_metrics.get("true_recovery_time_pct", 0),
+                "relentlessness_composite": rob_metrics.get("relentlessness_composite", 0),
+            }
+        results["robustness"] = robustness
+
     # Cleanup temp audio
     if audio_path.exists():
         audio_path.unlink()
@@ -747,15 +959,33 @@ def run_pipeline(input_dir, metadata_csv, output_dir):
     all_results = []
     summary_rows = []
 
+    # ── CHECKPOINT SUPPORT ────────────────────────────────────
+    checkpoint_path = output_dir / "checkpoint.json"
+    processed_files = set()
+    if checkpoint_path.exists():
+        try:
+            with open(checkpoint_path, "r") as f:
+                checkpoint = json.load(f)
+                all_results = checkpoint.get("results", [])
+                summary_rows = checkpoint.get("summary", [])
+                processed_files = {r["filename"] for r in all_results}
+            print(f"  ► Resuming from checkpoint: {len(processed_files)}/{len(video_files)} already done")
+        except Exception as e:
+            print(f"  ► Checkpoint corrupt, starting fresh: {e}")
+
     for i, vf in enumerate(video_files):
         print(f"\n[{i+1}/{len(video_files)}] {vf.name}")
+
+        if vf.name in processed_files:
+            print(f"    Skipping (already in checkpoint)")
+            continue
 
         # Run analysis
         try:
             result = analyze_single_video(vf, temp_dir)
         except Exception as e:
             print(f"    ERROR: Skipping {vf.name} — {e}")
-            result = {"filename": vf.name, "analysis_timestamp": datetime.now().isoformat()}
+            continue
 
         # Match metadata
         video_id = None
@@ -777,6 +1007,10 @@ def run_pipeline(input_dir, metadata_csv, output_dir):
             "lean": result.get("metadata", {}).get("lean", ""),
             "duration_seconds": result.get("cuts", {}).get("duration_seconds", 0),
             "cuts_per_minute": result.get("cuts", {}).get("cuts_per_minute", 0),
+            "full_audio_seconds": result.get("denominators", {}).get("full_audio_seconds", 0),
+            "speech_covered_seconds": result.get("denominators", {}).get("speech_covered_seconds", 0),
+            "non_speech_seconds": result.get("denominators", {}).get("non_speech_seconds", 0),
+            "speech_density_pct": result.get("denominators", {}).get("speech_density_pct", 0),
             "silence_pct": result.get("silence", {}).get("silence_percentage", 0),
             "wpm": result.get("speech", {}).get("wpm", 0),
             "music_detected": result.get("music", {}).get("music_detected", False),
@@ -788,6 +1022,9 @@ def run_pipeline(input_dir, metadata_csv, output_dir):
             "energy_cv": result.get("manipulation_metrics", {}).get("energy_cv", 0),
             "pitch_cv": result.get("manipulation_metrics", {}).get("pitch_cv", 0),
             "relentlessness_composite": result.get("manipulation_metrics", {}).get("relentlessness_composite", 0),
+            "activation_pressure": result.get("manipulation_metrics", {}).get("activation_pressure", 0),
+            "recovery_scarcity": result.get("manipulation_metrics", {}).get("recovery_scarcity", 0),
+            "space_compression": result.get("manipulation_metrics", {}).get("space_compression", 0),
         }
         summary_rows.append(summary)
 
@@ -798,6 +1035,13 @@ def run_pipeline(input_dir, metadata_csv, output_dir):
               f"High activation: {summary['high_activation_pct']}% | "
               f"Recovery: {summary['recovery_periods']} periods | "
               f"Relentlessness: {summary['relentlessness_composite']}")
+
+        # Save checkpoint after each video (Colab crash protection)
+        try:
+            with open(checkpoint_path, "w") as f:
+                json.dump({"results": all_results, "summary": summary_rows}, f, default=str)
+        except Exception:
+            pass  # Don't crash the pipeline over a checkpoint write failure
 
     # ── SAVE OUTPUTS ─────────────────────────────────────────
 
