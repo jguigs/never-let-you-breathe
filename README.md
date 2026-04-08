@@ -8,25 +8,26 @@ This project provides an open-source pipeline that analyzes YouTube Shorts (and 
 
 Across a 95-video pilot study of 10 creators spanning left-wing, right-wing, and non-political content:
 
-- Viral videos scored higher on **relentlessness** (sustained emotional activation with limited recovery) in **10 out of 10 creators**
-- The pattern was **bipartisan** — structurally identical across political orientation
-- Viral content spent **36% of runtime** in high-activation emotional states vs. **29%** for average-performing content from the same creators
-- Viral content was often **slower**, not faster — relentlessness is pressure, not speed
+- Viral videos scored higher on relentlessness composite in 10 out of 10 sampled creators
+- In the pilot, the same general directional pattern appeared across the sampled left-wing, right-wing, and non-political creators
+- Viral videos had a higher share of high-activation transcript windows on average (36.4% vs. 29.2%) than average-performing videos from the same creators
+- Viral content was often slower, not faster, by average speaking pace
 
 The production study (500 videos, 30 channels) is in progress.
 
 ## What It Measures
 
-| Metric | What It Captures |
-|--------|-----------------|
-| Emotional activation % | Time spent in fear, anger, sadness, disgust, surprise |
-| Recovery period count | Drops to neutral/joy after sustained activation |
-| Silence percentage | Actual silence in the audio track |
-| Speaking pace (WPM) | Words per minute from Whisper transcription |
-| Energy CV | Coefficient of variation in vocal energy (low = flatline high) |
-| Pitch CV | Coefficient of variation in pitch contour |
-| Cuts per minute | Visual scene changes per minute |
-| **Relentlessness composite** | Weighted combination of activation, recovery suppression, silence absence, and energy stability |
+| Metric                       | What It Captures                                                                                            |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Emotional activation %       | Share of transcript windows whose dominant emotion is fear, anger, sadness, disgust, or surprise            |
+| Recovery period count        | Transitions from high-activation windows into neutral/joy windows                                           |
+| Silence percentage           | Share of analyzed audio frames below the silence threshold                                                  |
+| Speaking pace (WPM)          | Words per minute from Whisper transcription                                                                 |
+| Energy CV                    | Coefficient of variation in vocal energy (lower = flatter energy contour)                                   |
+| Pitch CV                     | Coefficient of variation in pitch contour                                                                   |
+| Cuts per minute              | Visual scene changes per minute                                                                             |
+| **Relentlessness composite** | Exploratory weighted combination of activation, recovery suppression, silence absence, and energy stability |
+
 
 ## Pipeline Overview
 
@@ -82,10 +83,11 @@ bash data/download_videos.sh --cookies-from-browser firefox
 ### 3. Run Analysis
 
 ```bash
-# Pilot (fast): uses whisper tiny model
+# Run analysis
 python3 analyze_videos.py --input ./data/videos/ --metadata ./data/collected_videos.csv --output ./data/analysis/
 
-# Production: edit CONFIG whisper_model to "medium" first
+# Note: choose the Whisper model in CONFIG inside analyze_videos.py.
+# For larger production runs, medium is recommended.
 ```
 
 ### 4. View Results
