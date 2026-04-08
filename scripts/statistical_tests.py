@@ -142,6 +142,10 @@ def run_statistical_tests(summary_csv_path, output_path=None):
                 a_mean = np.mean([float(r[m]) for r in groups["average"]])
                 diffs.append(v_mean - a_mean)
         
+        if not diffs:
+            print(f"  {m:<28} — no valid paired creators, skipping")
+            continue
+
         mean_diff = np.mean(diffs)
         nonzero = [d for d in diffs if d != 0]
         
@@ -199,9 +203,97 @@ def run_statistical_tests(summary_csv_path, output_path=None):
             sig = "*" if p_sign < 0.05 else ""
             print(f"  {m:<28} {pos}/{len(diffs)} viral↑, {neg} avg↑, {tied} tied  (p={p_sign:.4f}) {sig}")
             results["tests"][m]["sign_test_viral_higher"] = pos
-            results["tests"][m]["sign_test_n"] = len(diffs)
+            results["tests"][m]["sign_test_n"] = n
             results["tests"][m]["sign_test_p"] = round(p_sign, 6)
     
+    # ── 5. Grouped analysis by political lean ─────────────────
+    print(f"\n{'─'*80}")
+    print(f"5. CREATOR-LEVEL DELTAS BY POLITICAL LEAN")
+    print(f"{'─'*80}")
+
+    # Build creator-level deltas with lean labels
+    creator_deltas = {}  # {channel: {"lean": str, "deltas": {metric: float}}}
+    for ch, groups in by_creator.items():
+        if groups["viral"] and groups["average"]:
+            # Get lean from the first viral row (consistent within creator)
+            lean = groups["viral"][0].get("lean", "")
+            deltas = {}
+            for m in metrics:
+                v_mean = np.mean([float(r[m]) for r in groups["viral"]])
+                a_mean = np.mean([float(r[m]) for r in groups["average"]])
+                deltas[m] = v_mean - a_mean
+            creator_deltas[ch] = {"lean": lean, "deltas": deltas}
+
+    # Group deltas by lean
+    lean_groups = defaultdict(list)  # {lean: [creator_deltas_dict, ...]}
+    for ch, info in creator_deltas.items():
+        label = info["lean"] if info["lean"] else "non-political"
+        lean_groups[label].append(info["deltas"])
+
+    grouped_results = {}
+    for label, delta_list in sorted(lean_groups.items()):
+        grouped_results[label] = {"n_creators": len(delta_list), "metrics": {}}
+        for m in metrics:
+            vals = [d[m] for d in delta_list]
+            pos = sum(1 for v in vals if v > 0)
+            neg = sum(1 for v in vals if v < 0)
+            zero = sum(1 for v in vals if v == 0)
+            grouped_results[label]["metrics"][m] = {
+                "n_creators": len(vals),
+                "mean_delta": round(float(np.mean(vals)), 4),
+                "median_delta": round(float(np.median(vals)), 4),
+                "positive_count": pos,
+                "negative_count": neg,
+                "zero_count": zero,
+            }
+
+    # Print summary table for key metrics
+    key_metrics = ["high_activation_pct", "recovery_pct", "relentlessness_composite", "cuts_per_minute"]
+    group_labels = sorted(lean_groups.keys())
+
+    print(f"\n  {'Metric':<28}", end="")
+    for label in group_labels:
+        n = len(lean_groups[label])
+        print(f" {label+'('+str(n)+')':>18}", end="")
+    print()
+
+    for m in key_metrics:
+        print(f"  {m:<28}", end="")
+        for label in group_labels:
+            info = grouped_results[label]["metrics"][m]
+            print(f" {info['mean_delta']:>+8.2f} ({info['positive_count']}↑{info['negative_count']}↓)", end="")
+        print()
+
+    # Kruskal-Wallis across lean groups where sample sizes permit
+    # Center (n=2) is too small for inferential testing — skip it
+    kw_eligible_labels = [label for label in group_labels if len(lean_groups[label]) >= 3 and label != "center"]
+
+    print(f"\n  Kruskal-Wallis across groups: {', '.join(kw_eligible_labels)}")
+    if "center" in group_labels:
+        print(f"  (center excluded: n={len(lean_groups['center'])}, too small for inferential test)")
+
+    for m in metrics:
+        kw_samples = [
+            [d[m] for d in lean_groups[label]]
+            for label in kw_eligible_labels
+        ]
+        # Need at least 2 groups with non-zero variance
+        nonempty = [s for s in kw_samples if len(s) >= 3]
+
+        if len(nonempty) >= 2:
+            h_stat, p_val = stats.kruskal(*kw_samples)
+            sig = "*" if p_val < 0.05 else ""
+            print(f"  {m:<28} H={h_stat:>7.2f}  p={p_val:.4f} {sig}")
+            for label in kw_eligible_labels:
+                grouped_results[label]["metrics"][m]["kruskal_wallis_H"] = round(float(h_stat), 4)
+                grouped_results[label]["metrics"][m]["kruskal_wallis_p"] = round(p_val, 6)
+        else:
+            print(f"  {m:<28} — skipped (fewer than 2 eligible groups with n≥3)")
+            for label in kw_eligible_labels:
+                grouped_results[label]["metrics"][m]["kruskal_wallis_skipped"] = "fewer than 2 eligible groups"
+
+    results["grouped_by_lean"] = grouped_results
+
     # ── Save results ─────────────────────────────────────────
     if output_path:
         with open(output_path, "w") as f:
