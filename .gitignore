@@ -1,0 +1,38 @@
+# Video files (too large for git)
+data/*/videos/
+*.webm
+*.mp4
+*.mkv
+*.wav
+*.avi
+*.mov
+
+# Full analysis JSON (3-4MB per study, too large)
+data/*/full_analysis.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Whisper model cache
+*.pt
+
+# Temp
+data/*/temp/

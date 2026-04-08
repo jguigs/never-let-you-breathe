@@ -1,0 +1,21 @@
+# Never Let You Breathe — Python Dependencies
+# Install: pip install -r requirements.txt
+# Also requires: sudo apt install ffmpeg
+
+# Core analysis
+openai-whisper>=20230918
+librosa>=0.10.0
+opencv-python-headless>=4.8.0
+transformers>=4.30.0
+torch>=2.0.0
+scipy>=1.11.0
+numpy>=1.24.0
+
+# Data collection
+google-api-python-client>=2.100.0
+yt-dlp>=2024.1.1
+
+# Optional: for Colab/notebook visualization
+# matplotlib>=3.7.0
+# pandas>=2.0.0
+# seaborn>=0.12.0
