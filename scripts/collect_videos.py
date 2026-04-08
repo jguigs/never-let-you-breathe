@@ -94,7 +94,7 @@ CHANNELS = [
 
     # Fitness/health
     {"name": "Jeff Nippard",      "handle": "@JeffNippard",       "domain": "non-political", "lean": "", "format": "fitness"},
-    {"name": "Athlean-X",         "handle": "@ataborning",        "domain": "non-political", "lean": "", "format": "fitness"},
+    {"name": "Athlean-X",         "handle": "@athleanx",           "domain": "non-political", "lean": "", "format": "fitness"},
 
     # Finance/business
     {"name": "Graham Stephan",    "handle": "@GrahamStephan",     "domain": "non-political", "lean": "", "format": "finance"},
@@ -109,15 +109,16 @@ CHANNELS = [
 # COLLECTION CONFIG
 # ─────────────────────────────────────────────────────────────
 
-VIRAL_COUNT = 5        # Top N viral Shorts per channel
+VIRAL_COUNT = 5        # Top N viral Shorts per channel (by view count)
 AVERAGE_COUNT = 5      # N average-performing Shorts per channel
+# Selection is within-channel and relative: viral = top-N by view count,
+# average = sampled from the middle of that channel's own distribution.
+# No fixed absolute view-count thresholds are used.
 # Targeting ~300 videos (30 channels × 10 each), with some channels
 # potentially having fewer Shorts available. Overflow channels provide buffer.
 
 MIN_DURATION = 15      # Minimum Short duration (seconds)
 MAX_DURATION = 61      # Maximum Short duration (seconds)
-MIN_VIEWS_VIRAL = 500_000    # Minimum views to consider "viral" tier
-MAX_VIEWS_AVERAGE = None     # Auto-calculated per channel (median range)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -139,7 +140,17 @@ def get_youtube_client():
 
 def get_channel_id(youtube, handle):
     """Resolve a @handle to a channel ID."""
-    # Try search first (handles aren't directly supported in channels.list)
+    # Try exact handle lookup first
+    clean_handle = handle.lstrip("@")
+    request = youtube.channels().list(
+        part="id",
+        forHandle=clean_handle,
+    )
+    response = request.execute()
+    if response.get("items"):
+        return response["items"][0]["id"]
+
+    # Fallback: fuzzy search
     request = youtube.search().list(
         part="snippet",
         q=handle,
@@ -150,16 +161,6 @@ def get_channel_id(youtube, handle):
 
     if response.get("items"):
         return response["items"][0]["snippet"]["channelId"]
-
-    # Fallback: try channels.list with forHandle
-    clean_handle = handle.lstrip("@")
-    request = youtube.channels().list(
-        part="id",
-        forHandle=clean_handle,
-    )
-    response = request.execute()
-    if response.get("items"):
-        return response["items"][0]["id"]
 
     return None
 
