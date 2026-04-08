@@ -145,9 +145,9 @@ If you use this pipeline in research, please cite:
 ```
 @misc{neverletyoubreathe2026,
   title={Never Let You Breathe: Measuring Structural Manipulation in Short-Form Video},
-  author={[Justin McGuigan]},
+  author={Justin McGuigan},
   year={2026},
-  url={https://github.com/[jguigs]/never-let-you-breathe}
+  url={https://github.com/jguigs/never-let-you-breathe}
 }
 ```
 
