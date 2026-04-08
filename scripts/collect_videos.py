@@ -293,6 +293,7 @@ def run_collection(output_dir):
 
         # Resolve channel ID
         channel_id = get_channel_id(youtube, ch["handle"])
+        ch["resolved_channel_id"] = channel_id
         if not channel_id:
             print(f"    WARNING: Could not resolve channel ID for {ch['handle']}")
             channel_summary.append({
@@ -326,19 +327,25 @@ def run_collection(output_dir):
         for v in viral:
             v["channel_name"] = ch["name"]
             v["channel_handle"] = ch["handle"]
+            v["channel_id"] = channel_id
             v["domain"] = ch["domain"]
             v["lean"] = ch["lean"]
             v["format_type"] = ch["format"]
             v["viral_status"] = "viral"
+            v["collection_version"] = "2.0"
+            v["collection_date"] = datetime.now().isoformat()
             all_selected.append(v)
 
         for a in average:
             a["channel_name"] = ch["name"]
             a["channel_handle"] = ch["handle"]
+            a["channel_id"] = channel_id
             a["domain"] = ch["domain"]
             a["lean"] = ch["lean"]
             a["format_type"] = ch["format"]
             a["viral_status"] = "average"
+            a["collection_version"] = "2.0"
+            a["collection_date"] = datetime.now().isoformat()
             all_selected.append(a)
 
         selected = len(viral) + len(average)
@@ -350,6 +357,7 @@ def run_collection(output_dir):
 
         channel_summary.append({
             "name": ch["name"], "handle": ch["handle"],
+            "channel_id": channel_id,
             "domain": ch["domain"], "lean": ch["lean"],
             "format": ch["format"],
             "total_shorts_found": len(shorts),
